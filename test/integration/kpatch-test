@@ -28,8 +28,6 @@
 #
 # - foo.patch: patch that should build successfully
 #
-# - foo-SLOW.patch: patch that should be skipped in the quick test
-#
 # - bar-FAIL.patch: patch that should fail to build
 #
 # - foo-LOADED.test: executable which tests whether the foo.patch module is
@@ -40,24 +38,33 @@
 # built from the *.patch files.  They can be used for more custom tests above
 # and beyond the simple loading and unloading tests.
 
+shopt -s nullglob
+
 SCRIPTDIR="$(readlink -f $(dirname $(type -p $0)))"
 ROOTDIR="$(readlink -f $SCRIPTDIR/../..)"
 # TODO: option to use system-installed binaries instead
 KPATCH="sudo $ROOTDIR/kpatch/kpatch"
 RMMOD="sudo rmmod"
+unset CCACHE_HASHDIR
 KPATCHBUILD="$ROOTDIR"/kpatch-build/kpatch-build
 ERROR=0
 LOG=test.log
-rm -f $LOG
+rm -f *.log
+
+PATCHDIR="${PATCHDIR:-$PWD}"
+declare -a PATCH_LIST
+declare -a TEST_LIST
 
 usage() {
-	echo "usage: $0 [options]" >&2
+	echo "usage: $0 [options] [patch1 ... patchN]" >&2
+	echo "		patchN  	Pathnames of patches to test" >&2
 	echo "		-h, --help	Show this help message" >&2
 	echo "		-c, --cached	Don't rebuild patch modules" >&2
-	echo "		-q, --quick	Just combine all patches into one module for testing" >&2
+	echo "		-d, --directory	Patch directory" >&2
+	echo "		-q, --quick	Test combined patch and -FAIL patches only" >&2
 }
 
-options=$(getopt -o hcq -l "help,cached,quick" -- "$@") || exit 1
+options=$(getopt -o hcd:q -l "help,cached,directory,quick" -- "$@") || exit 1
 
 eval set -- "$options"
 
@@ -70,13 +77,35 @@ while [[ $# -gt 0 ]]; do
 	-c|--cached)
 		SKIPBUILD=1
 		;;
+	-d|--directory)
+		PATCHDIR="$2"
+		shift
+		;;
 	-q|--quick)
 		QUICK=1
+		;;
+	*)
+		[[ "$1" = "--" ]] && shift && continue
+		PATCH_LIST+=("$1")
 		;;
 	esac
 	shift
 done
 
+if [[ ${#PATCH_LIST[@]} = 0 ]]; then
+	PATCH_LIST=($PATCHDIR/*.patch)
+	TEST_LIST=($PATCHDIR/*.test)
+	if [[ ${#PATCH_LIST[@]} = 0 ]]; then
+		echo "No patches found!"
+		exit 1
+	fi
+else
+	for file in "${PATCH_LIST[@]}"; do
+		prefix=${file%%.patch}
+		[[ -e "$prefix-FAIL.test" ]]   && TEST_LIST+=("$prefix-FAIL.test")
+		[[ -e "$prefix-LOADED.test" ]] && TEST_LIST+=("$prefix-LOADED.test")
+	done
+fi
 
 error() {
 	echo "ERROR: $@" |tee -a $LOG >&2
@@ -88,22 +117,21 @@ log() {
 }
 
 unload_all() {
-	for i in `lsmod |egrep '^kpatch' |awk '{print $1}'`; do
+	for i in `/sbin/lsmod |egrep '^kpatch' |awk '{print $1}'`; do
 		if [[ $i != kpatch ]]; then
 			$KPATCH unload $i >> $LOG 2>&1 || error "\"kpatch unload $i\" failed"
 		fi
 	done
-	if lsmod |egrep -q '^kpatch'; then
+	if /sbin/lsmod |egrep -q '^kpatch'; then
 		$RMMOD kpatch >> $LOG 2>&1 || error "\"rmmod kpatch\" failed"
 	fi
 }
 
 build_module() {
 	file=$1
-	prefix=${file%%.patch}
-	module=kpatch-$prefix.ko
-
-	[[ $prefix = COMBINED ]] && return
+	prefix=$(basename ${file%%.patch})
+	modname="test-$prefix"
+	module="${modname}.ko"
 
 	if [[ $prefix =~ -FAIL ]]; then
 		shouldfail=1
@@ -120,8 +148,11 @@ build_module() {
 
 	log "build: $prefix"
 
-	if ! $KPATCHBUILD $file >> $LOG 2>&1; then
-		[[ $shouldfail -eq 0 ]] && error "$prefix: build failed"
+	if ! $KPATCHBUILD -n $modname $file >> $LOG 2>&1; then
+		if [[ $shouldfail -eq 0 ]]; then
+			error "$prefix: build failed"
+			cp $HOME/.kpatch/build.log $prefix.log
+		fi
 	else
 		[[ $shouldfail -eq 1 ]] && error "$prefix: build succeeded when it should have failed"
 	fi
@@ -129,11 +160,11 @@ build_module() {
 
 run_load_test() {
 	file=$1
-	prefix=${file%%.patch}
-	module=kpatch-$prefix.ko
-	testprog=$prefix-LOADED.test
+	prefix=$(basename ${file%%.patch})
+	modname="test-$prefix"
+	module="${modname}.ko"
+	testprog="$(dirname $1)/$prefix-LOADED.test"
 
-	[[ $prefix = COMBINED ]] && return
 	[[ $prefix =~ -FAIL ]] && return
 
 	if [[ ! -e $module ]]; then
@@ -148,23 +179,8 @@ run_load_test() {
 	fi
 
 
-	if ! $KPATCH replace $module >> $LOG 2>&1; then
-		error "$prefix: kpatch replace failed"
-		return
-	fi
-
-	if [[ -e $testprog ]] && ! ./$testprog >> $LOG 2>&1; then
-		error "$prefix: $testprog failed after kpatch replace"
-		return
-	fi
-
-	if ! $KPATCH unload $module >> $LOG 2>&1; then
-		error "$prefix: kpatch unload failed"
-		return
-	fi
-
-	if [[ -e $testprog ]] && ./$testprog >> $LOG 2>&1; then
-		error "$prefix: $testprog succeeded after kpatch unload"
+	if [[ -e $testprog ]] && $testprog >> $LOG 2>&1; then
+		error "$prefix: $testprog succeeded before kpatch load"
 		return
 	fi
 
@@ -173,103 +189,119 @@ run_load_test() {
 		return
 	fi
 
-	if [[ -e $testprog ]] && ! ./$testprog >> $LOG 2>&1; then
+	if [[ -e $testprog ]] && ! $testprog >> $LOG 2>&1; then
 		error "$prefix: $testprog failed after kpatch load"
+	fi
+
+	if ! $KPATCH unload $module >> $LOG 2>&1; then
+		error "$prefix: kpatch unload failed"
+		return
+	fi
+
+	if [[ -e $testprog ]] && $testprog >> $LOG 2>&1; then
+		error "$prefix: $testprog succeeded after kpatch unload"
 		return
 	fi
 }
 
 run_custom_test() {
 	testprog=$1
-	prefix=${file%%.test}
+	prefix=$(basename ${testprog%%.test})
 
 	[[ $testprog = *-LOADED.test ]] && return
 
 	log "custom test: $prefix"
 
-	if ! ./$testprog >> $LOG 2>&1; then
+	if ! $testprog >> $LOG 2>&1; then
 		error "$prefix: test failed"
 	fi
 }
 
 build_combined_module() {
 
-	if [[ $SKIPBUILD -eq 1 ]] && [[ -e kpatch-COMBINED.ko ]]; then
+	if [[ $SKIPBUILD -eq 1 ]] && [[ -e test-COMBINED.ko ]]; then
 		log "skipping build: combined"
 		return
 	fi
 
-	if ! which combinediff > /dev/null; then
-		log "patchutils not installed, skipping combined module build"
-		error "PLEASE INSTALL PATCHUTILS"
+	declare -a COMBINED_LIST
+	for file in "${PATCH_LIST[@]}"; do
+		[[ $file =~ -FAIL ]] && log "combine: skipping $file" && continue
+		COMBINED_LIST+=($file)
+	done
+	if [[ ${#COMBINED_LIST[@]} -le 1 ]]; then
+		log "skipping build: combined (only ${#PATCH_LIST[@]} patch(es))"
 		return
 	fi
 
-	rm -f COMBINED.patch TMP.patch
-	first=1
-	for file in *.patch; do
-		prefix=${file%%.patch}
-
-		[[ $prefix =~ -FAIL ]] && continue
-		[[ $prefix =~ -SLOW ]] && continue
-
-		log "combine: $prefix"
-
-		if [[ $first -eq 1 ]]; then
-			cp -f $file COMBINED.patch
-			first=0
-			continue
-		fi
-
-		combinediff COMBINED.patch $file > TMP.patch
-		mv -f TMP.patch COMBINED.patch
-	done
-
 	log "build: combined module"
 
-	if ! $KPATCHBUILD COMBINED.patch >> $LOG 2>&1; then
+	if ! $KPATCHBUILD -n test-COMBINED "${COMBINED_LIST[@]}" >> $LOG 2>&1; then
 		error "combined build failed"
+		cp $HOME/.kpatch/build.log combined.log
 	fi
 }
 
 run_combined_test() {
-	if [[ ! -e kpatch-COMBINED.ko ]]; then
-		log "can't find kpatch-COMBINED.ko, skipping"
+	if [[ ! -e test-COMBINED.ko ]]; then
+		log "can't find test-COMBINED.ko, skipping"
 		return
 	fi
 
 	log "load test: combined module"
 
-	if ! $KPATCH replace kpatch-COMBINED.ko >> $LOG 2>&1; then
-		error "combined: kpatch replace failed"
+	unload_all
+
+	for testprog in "${TEST_LIST[@]}"; do
+		[[ $testprog != *-LOADED.test ]] && continue
+		if $testprog >> $LOG 2>&1; then
+			error "combined: $testprog succeeded before kpatch load"
+			return
+		fi
+	done
+
+	if ! $KPATCH load test-COMBINED.ko >> $LOG 2>&1; then
+		error "combined: kpatch load failed"
 		return
 	fi
 
-	for testprog in *.test; do
+	for testprog in "${TEST_LIST[@]}"; do
 		[[ $testprog != *-LOADED.test ]] && continue
-		if ! ./$testprog >> $LOG 2>&1; then
-			error "combined: $testprog failed"
+		if ! $testprog >> $LOG 2>&1; then
+			error "combined: $testprog failed after kpatch load"
 		fi
 	done
+
+	if ! $KPATCH unload test-COMBINED.ko >> $LOG 2>&1; then
+		error "combined: kpatch unload failed"
+		return
+	fi
+
+	for testprog in "${TEST_LIST[@]}"; do
+		[[ $testprog != *-LOADED.test ]] && continue
+		if $testprog >> $LOG 2>&1; then
+			error "combined: $testprog succeeded after kpatch unload"
+			return
+		fi
+	done
+
 }
 
 echo "clearing printk buffer"
 sudo dmesg -C
 
-cd "$SCRIPTDIR"
-
-if [[ $QUICK != 1 ]]; then
-	for file in *.patch; do
+for file in "${PATCH_LIST[@]}"; do
+	if [[ $QUICK != 1 || $file =~ -FAIL ]]; then
 		build_module $file
-	done
-fi
+	fi
+done
 
 build_combined_module
 
 unload_all
 
 if [[ $QUICK != 1 ]]; then
-	for file in *.patch; do
+	for file in "${PATCH_LIST[@]}"; do
 		run_load_test $file
 	done
 fi
@@ -277,16 +309,21 @@ fi
 run_combined_test
 
 if [[ $QUICK != 1 ]]; then
-	for file in *.test; do
-		unload_all
-		run_custom_test $file
+	for testprog in "${TEST_LIST[@]}"; do
+		if [[ ! $testprog =~ -FAIL ]]; then
+			unload_all
+			run_custom_test $testprog
+		fi
 	done
 fi
 
 
 unload_all
 
-dmesg |grep -q "Call Trace" && error "kernel error detected in printk buffer"
+if dmesg | grep -q "Call Trace"; then
+	dmesg > dmesg.log
+	error "kernel error detected in printk buffer"
+fi
 
 if [[ $ERROR -gt 0 ]]; then
 	log "$ERROR errors encountered"

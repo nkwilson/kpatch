@@ -11,13 +11,13 @@ currently running and creates a kernel module that will replace
 modified functions in the kernel such that the patched code takes 
 effect.
 
-This script currently only works on Fedora and will need to be adapted 
-to work on other distros.  
-
 .SH OPTIONS
 
 -h|--help
    Show this help message
+
+-a|--archversion
+   Specify the kernel arch version
 
 -r|--sourcerpm
    Specify kernel source RPM
@@ -31,11 +31,28 @@ to work on other distros.
 -v|--vmlinux
    Specify original vmlinux
 
+-j|--jobs
+   Specify the number of make jobs
+
 -t|--target
    Specify custom kernel build targets
 
+-n|--name
+   Specify the name of the kpatch module
+
+-o|--output
+   Specify output folder
+
 -d|--debug
    Keep scratch files in /tmp
+   (can be specified multiple times)
+
+-e|--oot-module
+   Enable patching out-of-tree module,
+   specify current version of module
+
+--skip-cleanup
+   Skip post-build cleanup
 
 --skip-gcc-check
    Skips check that ensures that the system gcc version and

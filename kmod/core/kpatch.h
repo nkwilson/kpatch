@@ -38,6 +38,7 @@ struct kpatch_func {
 	unsigned long new_size;
 	unsigned long old_addr;
 	unsigned long old_size;
+	unsigned long sympos;
 	const char *name;
 	struct list_head list;
 	int force;
@@ -45,21 +46,18 @@ struct kpatch_func {
 	/* private */
 	struct hlist_node node;
 	enum kpatch_op op;
+	struct kobject kobj;
 };
 
 struct kpatch_dynrela {
 	unsigned long dest;
 	unsigned long src;
 	unsigned long type;
+	unsigned long sympos;
 	const char *name;
 	int addend;
 	int external;
 	struct list_head list;
-};
-
-struct kpatch_hook {
-	struct list_head list;
-	void (*hook)(void);
 };
 
 struct kpatch_object {
@@ -67,11 +65,16 @@ struct kpatch_object {
 	const char *name;
 	struct list_head funcs;
 	struct list_head dynrelas;
-	struct list_head hooks_load;
-	struct list_head hooks_unload;
+
+	int (*pre_patch_callback)(struct kpatch_object *);
+	void (*post_patch_callback)(struct kpatch_object *);
+	void (*pre_unpatch_callback)(struct kpatch_object *);
+	void (*post_unpatch_callback)(struct kpatch_object *);
+	bool callbacks_enabled;
 
 	/* private */
 	struct module *mod;
+	struct kobject kobj;
 };
 
 struct kpatch_module {
@@ -84,9 +87,10 @@ struct kpatch_module {
 
 	/* private */
 	struct list_head list;
+	struct kobject kobj;
 };
 
-extern struct kobject *kpatch_patches_kobj;
+extern struct kobject *kpatch_root_kobj;
 
 extern int kpatch_register(struct kpatch_module *kpmod, bool replace);
 extern int kpatch_unregister(struct kpatch_module *kpmod);

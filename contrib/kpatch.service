@@ -1,0 +1,11 @@
+[Unit]
+Description="Apply kpatch kernel patches"
+ConditionKernelCommandLine=!kpatch.enable=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=PREFIX/sbin/kpatch load --all
+
+[Install]
+WantedBy=multi-user.target

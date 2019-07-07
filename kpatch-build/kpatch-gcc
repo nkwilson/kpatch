@@ -1,24 +1,33 @@
 #!/bin/bash
 
-set -x
+if [[ ${KPATCH_GCC_DEBUG:-0} -ne 0 ]]; then
+	set -o xtrace
+fi
 
 TOOLCHAINCMD="$1"
 shift
 
-if [[ -z "$TEMPDIR" ]]; then
-    exec "$TOOLCHAINCMD" "$@"
+if [[ -z "$KPATCH_GCC_TEMPDIR" ]]; then
+	exec "$TOOLCHAINCMD" "$@"
 fi
 
 declare -a args=("$@")
 
-if [[ "$TOOLCHAINCMD" = "gcc" ]] ; then
+if [[ "$TOOLCHAINCMD" =~ "gcc" ]] ; then
 	while [ "$#" -gt 0 ]; do
 		if [ "$1" = "-o" ]; then
-			obj=$2
-			[[ $2 = */.tmp_*.o ]] && obj=${2/.tmp_/}
-			case "$obj" in
+			obj="$2"
+
+			# skip copying the temporary .o files created by
+			# recordmcount.pl
+			[[ "$obj" = */.tmp_mc_*.o ]] && break;
+
+			[[ "$obj" = */.tmp_*.o ]] && obj="${obj/.tmp_/}"
+			relobj=${obj//$KPATCH_GCC_SRCDIR\//}
+			case "$relobj" in
 				*.mod.o|\
 				*built-in.o|\
+				*built-in.a|\
 				vmlinux.o|\
 				.tmp_kallsyms1.o|\
 				.tmp_kallsyms2.o|\
@@ -30,13 +39,18 @@ if [[ "$TOOLCHAINCMD" = "gcc" ]] ; then
 				arch/x86/boot/compressed/piggy.o|\
 				kernel/system_certificates.o|\
 				arch/x86/vdso/*|\
-				.*.o)
+				arch/x86/entry/vdso/*|\
+				drivers/firmware/efi/libstub/*|\
+				arch/powerpc/kernel/prom_init.o|\
+				lib/*|\
+				.*.o|\
+				*/.lib_exports.o)
 					break
 					;;
 				*.o)
-					mkdir -p "$TEMPDIR/orig/$(dirname $obj)"
-					cp -f "$obj" "$TEMPDIR/orig/$obj"
-					echo "$obj" >> "$TEMPDIR/changed_objs"
+					mkdir -p "$KPATCH_GCC_TEMPDIR/orig/$(dirname "$relobj")"
+					[[ -e "$obj" ]] && cp -f "$obj" "$KPATCH_GCC_TEMPDIR/orig/$relobj"
+					echo "$relobj" >> "$KPATCH_GCC_TEMPDIR/changed_objs"
 					break
 					;;
 				*)
@@ -49,11 +63,16 @@ if [[ "$TOOLCHAINCMD" = "gcc" ]] ; then
 elif [[ "$TOOLCHAINCMD" = "ld" ]] ; then
 	while [ "$#" -gt 0 ]; do
 		if [ "$1" = "-o" ]; then
-			obj=$2
+			obj="$2"
+			relobj=${obj//$KPATCH_GCC_SRCDIR\//}
 			case "$obj" in
 				*.ko)
-					mkdir -p "$TEMPDIR/module/$(dirname $obj)"
-					cp -f "$obj" "$TEMPDIR/module/$obj"
+					mkdir -p "$KPATCH_GCC_TEMPDIR/module/$(dirname "$relobj")"
+					cp -f "$obj" "$KPATCH_GCC_TEMPDIR/module/$relobj"
+					break
+					;;
+				.tmp_vmlinux*|vmlinux)
+					args+=(--warn-unresolved-symbols)
 					break
 					;;
 				*)
